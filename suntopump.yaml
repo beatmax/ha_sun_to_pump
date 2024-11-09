@@ -1,0 +1,565 @@
+################################################################
+## SunToPump: Excess solar power to heat pump
+## Source and info: https://github.com/beatmax/ha_sun_to_pump
+################################################################
+
+################################################
+## Customize
+################################################
+homeassistant:
+  customize:
+    package.node_anchors:
+      common: &common
+        package: "suntopump"
+
+      config:
+        # Input sensor entity ids.
+        input_sensors: &input_sensors
+          eid_active_power: sensor.p1_meter_XXXX_active_power
+          eid_heatpump_power_input: sensor.heatpump_XXXX_powerinput
+          eid_outside_temperature: sensor.heatpump_XXXX_temperatureoutside
+          eid_room_temperature: sensor.heatpump_thermostat_room_temperature
+          eid_room_setpoint: sensor.heatpump_thermostat_room_setpoint
+
+        # Thermostat entity id.
+        thermostat: &eid_thermostat climate.tstat_XXXX_thermostat
+
+        # Time constraints. Thermostat is only controlled within these times.
+        time_condition: &time_condition
+          enabled: true
+          after: "08:00:00"
+          before: "20:00:00"
+
+        # Available power filter. An average of recent 'available power' is
+        # calculated for each of the time windows given here. The 'power_hint'
+        # (how much power is desired for the heat pump to use) is the minimum
+        # of these two averages. This makes the automation quicker to react to
+        # a decrease in available power, and slower to react to an increase
+        # (ensure that conditions are stable before raising the thermostat).
+        available_power_filter:
+          - &avg_short_minutes 2
+          - &avg_long_minutes 10
+
+        # Setpoint hold times. The setpoint will only be raised or dropped if
+        # the last change was at least this number of minutes ago.
+        setpoint_hold: &setpoint_hold
+          hold_time_raise_minutes: 20
+          hold_time_drop_minutes: 10
+
+        power_table_record: &record
+          # Do not update the power table if the last setpoint change was
+          # less than this number of minutes ago.
+          min_stable_setpoint_minutes: 2
+
+          # Reset. Set to true (and then back to false) to remove recorded power
+          # values (reset sensor.suntopump_power_table_record).
+          power_table_reset: false
+
+    input_boolean.suntopump_active: *common
+    input_number.suntopump_setpoint_max: *common
+    input_number.suntopump_setpoint_min: *common
+    input_number.suntopump_boost: *common
+    input_number.suntopump_def_td_0w: *common
+    input_number.suntopump_def_power_td30: *common
+    input_number.suntopump_def_power_raise1: *common
+    sensor.suntopump_power_table_defaults: *common
+    sensor.suntopump_power_table_record: *common
+    sensor.suntopump_power_table: *common
+    sensor.suntopump_power_table_value: *common
+    sensor.suntopump_power_to_raise: *common
+    sensor.suntopump_available_power: *common
+    sensor.suntopump_power_hint: *common
+    sensor.suntopump_setpoint_hint: *common
+    sensor.suntopump_setpoint: *common
+    sensor.suntopump_retry_count: *common
+    sensor.suntopump_available_power_avg_short: *common
+    sensor.suntopump_available_power_avg_long: *common
+    automation.SunToPump:
+      <<: *common
+      icon: mdi:sun-thermometer
+
+################################################
+## Inputs
+################################################
+input_boolean:
+  suntopump_active:
+    name: "SunToPump active"
+    icon: mdi:sun-thermometer
+
+input_number:
+  suntopump_setpoint_max:
+    name: "SunToPump setpoint max"
+    icon: mdi:arrow-collapse-up
+    mode: slider
+    min: 0
+    max: 40
+    initial: 22
+    unit_of_measurement: "°C"
+
+  suntopump_setpoint_min:
+    name: "SunToPump setpoint min"
+    icon: mdi:arrow-collapse-down
+    mode: slider
+    min: 0
+    max: 40
+    initial: 20
+    unit_of_measurement: "°C"
+
+  suntopump_boost:
+    name: "SunToPump boost"
+    icon: mdi:transmission-tower
+    mode: slider
+    min: 0
+    max: 2000
+    initial: 0
+    unit_of_measurement: "W"
+
+  suntopump_def_td_0w:
+    name: "SunToPump td_0w"
+    mode: box
+    min: 0
+    max: 40
+    initial: 5
+    unit_of_measurement: "W"
+
+  suntopump_def_power_td30:
+    name: "SunToPump power_td30"
+    mode: box
+    min: 0
+    max: 100000
+    initial: 1000
+    unit_of_measurement: "W"
+
+  suntopump_def_power_raise1:
+    name: "SunToPump power_raise1"
+    mode: box
+    min: 0
+    max: 100000
+    initial: 1000
+    unit_of_measurement: "W"
+
+###############################################################################
+# Power table structure
+###############################################################################
+#
+#                     0       0.1     0.2           2.0      <- setpoint-troom
+#       0           [[p_0_0,  p_0_1,  p_0_2,  ...,  p_0_20],
+#       1            [p_1_0,  p_1_1,  p_1_2,  ...,  p_1_20],
+#       ...          ...
+#       32           [p_32_0, p_32_1, p_32_2, ...,  p_32_20]]
+#       ^
+#   troom-tout
+#
+# E.g., if troom=20.2, setpoint=21, tout=10, then
+#       p_10_8, or table[10][8], is the expected power use of the heat pump in
+#       these conditions.
+#
+# In general: p_<i>_<j> (or table[i][j]) is the power used for:
+#   i = (troom - tout) | round             (0 <= i <= 32)
+#   j = ((setpoint - troom) * 10) | round  (0 <= j <= 20)
+#
+# If troom < tout, i=0 is used (measured outside temperature may be too high,
+# e.g., when the heat pump is hit by the sun).
+#
+# If setpoint < troom, the table is not used; power is (probably) zero.
+###############################################################################
+
+# Note: Unfortunately some macros are repeated multiple times. See feature request:
+# https://community.home-assistant.io/t/per-package-macros/737247
+
+################################################
+## Template sensors
+################################################
+template:
+  - sensor:
+    - name: "suntopump_power_table_defaults"
+      state: ""
+      attributes:
+        table: >
+          {% macro input_number(name) -%}
+          {{ states('input_number.suntopump_' + name) }}
+          {%- endmacro %}
+
+          {% set power_td30 = input_number('def_power_td30') | float %}
+          {% set td_0w = input_number('def_td_0w') | float %}
+          {% set power_raise1 = input_number('def_power_raise1') | float %}
+
+          {% set ns = namespace(table=[], pow_raise=[], pow=[]) %}
+
+          {% for j in range(21) %}
+            {% set ns.pow_raise = ns.pow_raise + [power_raise1 * j / 10] %}
+          {% endfor %}
+
+          {% for i in range(33) %}
+            {% set t_to_t0 = [i - td_0w, 0] | max %}
+            {% set t_range = 30 - td_0w %}
+            {% set pow_keep = power_td30 * t_to_t0 / t_range %}
+
+            {% set ns.pow = [] %}
+            {% for j in range(ns.pow_raise | length) %}
+              {% set ns.pow = ns.pow + [pow_keep + ns.pow_raise[j]] %}
+            {% endfor %}
+
+            {% set ns.table = ns.table + [ns.pow] %}
+          {% endfor %}
+
+          {{ ns.table }}
+
+  - trigger:
+    - trigger: time_pattern
+      minutes: "/1"
+      variables:
+        <<: *input_sensors
+        <<: *record
+    - platform: event
+      event_type: event_template_reloaded
+      variables:
+        <<: *input_sensors
+        <<: *record
+    sensor:
+      - name: "suntopump_power_table_record"
+        state: ""
+        attributes:
+          table: >
+            {% macro power_table_position(table, setpoint, troom, tout) -%}
+            {% set i_max = table | length - 1 %}
+            {% set j_max = table[0] | length - 1 %}
+            {% set i = ([0, troom - tout, i_max] | sort)[1] | round %}
+            {% set j = ([0, (setpoint - troom) * 10, j_max] | sort)[1] | round %}
+            {{ [i, j] }}
+            {%- endmacro %}
+
+            {% macro power_table_update(table, setpoint, troom, tout, power) -%}
+            {% if setpoint >= troom %}
+              {% set i, j = power_table_position(table, setpoint, troom, tout) | from_json %}
+              {% set ti = table[i] %}
+              {% set table = table[0:i] + [ti[0:j] + [power] + ti[j+1:]] + table[i+1:] %}
+            {% endif %}
+            {{ table }}
+            {%- endmacro %}
+
+            {% set table = this.attributes.get('table') %}
+            {% if table is none or power_table_reset %}
+              {% set table_defaults = state_attr('sensor.suntopump_power_table_defaults', 'table') %}
+              {% set i_size = table_defaults | length %}
+              {% set j_size = table_defaults[0] | length %}
+              {% set table = [[none] * j_size] * i_size %}
+            {% endif %}
+
+            {% set setpoint = states(eid_room_setpoint) | float(none) %}
+            {% set troom = states(eid_room_temperature) | float(none) %}
+            {% set tout = states(eid_outside_temperature) | float(none) %}
+            {% set hp_power = states(eid_heatpump_power_input) | float(none) %}
+
+            {% if is_number(setpoint) and is_number(troom) and is_number(tout) and is_number(hp_power) %}
+              {% set hp_power = hp_power | round %}
+              {% set last_setpoint_change = as_timestamp(states[eid_room_setpoint].last_changed) | int %}
+
+              {% if (as_timestamp(now()) - last_setpoint_change) >= (min_stable_setpoint_minutes * 60) %}
+                {% set table = power_table_update(table, setpoint, troom, tout, hp_power) %}
+              {% endif %}
+            {% endif %}
+
+            {{ table }}
+
+  - sensor:
+      - name: "suntopump_power_table"
+        state: ""
+        attributes:
+          table: >
+            {% set table_defaults = state_attr('sensor.suntopump_power_table_defaults', 'table') %}
+            {% set table_record = state_attr('sensor.suntopump_power_table_record', 'table') %}
+
+            {% if table_defaults is none or table_record is none %}
+              {{ table_defaults }}
+            {% else %}
+              {% set i_size = table_defaults | length %}
+              {% set j_size = table_defaults[0] | length %}
+              {% set ns = namespace(table=[], pow=[]) %}
+
+              {% for i in range(i_size) %}
+                {% set ns.pow = [] %}
+                {% for j in range(j_size) %}
+                  {% set record = table_record[i][j] %}
+                  {% set ns.pow = ns.pow + [record if is_number(record) else table_defaults[i][j]] %}
+                {% endfor %}
+
+                {% set ns.table = ns.table + [ns.pow] %}
+              {% endfor %}
+
+              {{ ns.table }}
+            {% endif %}
+
+  # For monitoring purposes, shows power table value for current conditions.
+  - trigger:
+    - trigger: time_pattern
+      minutes: "/1"
+      variables: *input_sensors
+    - platform: event
+      event_type: event_template_reloaded
+      variables: *input_sensors
+    sensor:
+      - name: "suntopump_power_table_value"
+        unit_of_measurement: "W"
+        device_class: "power"
+        state: >
+          {% macro power_table_position(table, setpoint, troom, tout) -%}
+          {% set i_max = table | length - 1 %}
+          {% set j_max = table[0] | length - 1 %}
+          {% set i = ([0, troom - tout, i_max] | sort)[1] | round %}
+          {% set j = ([0, (setpoint - troom) * 10, j_max] | sort)[1] | round %}
+          {{ [i, j] }}
+          {%- endmacro %}
+
+          {% macro power_table_value(table, setpoint, troom, tout) -%}
+          {% if setpoint >= troom %}
+            {% set i, j = power_table_position(table, setpoint, troom, tout) | from_json %}
+            {{ table[i][j] }}
+          {% else %}
+            {{ 0 }}
+          {% endif %}
+          {%- endmacro %}
+
+          {% set setpoint = states(eid_room_setpoint) | float(none) %}
+          {% set troom = states(eid_room_temperature) | float(none) %}
+          {% set tout = states(eid_outside_temperature) | float(none) %}
+          {% set table = state_attr('sensor.suntopump_power_table', 'table') %}
+
+          {% if setpoint is none or troom is none or tout is none or table is none %}
+            {{ -1 }}
+          {% else %}
+            {{ power_table_value(table, setpoint, troom, tout) }}
+          {% endif %}
+
+  # For monitoring purposes, shows the expected power consumption if the
+  # thermostat was raised 0.5 degrees.
+  - trigger:
+    - trigger: time_pattern
+      minutes: "/1"
+      variables: *input_sensors
+    - platform: event
+      event_type: event_template_reloaded
+      variables: *input_sensors
+    sensor:
+      - name: "suntopump_power_to_raise"
+        unit_of_measurement: "W"
+        device_class: "power"
+        state: >
+          {% macro power_table_position(table, setpoint, troom, tout) -%}
+          {% set i_max = table | length - 1 %}
+          {% set j_max = table[0] | length - 1 %}
+          {% set i = ([0, troom - tout, i_max] | sort)[1] | round %}
+          {% set j = ([0, (setpoint - troom) * 10, j_max] | sort)[1] | round %}
+          {{ [i, j] }}
+          {%- endmacro %}
+
+          {# Note: Similar to power_table_value(), but with raised setpoint, and using
+           # 'table[i][j:] | min'; there may be a lower power stored for a higher setpoint. #}
+          {% macro power_to_raise(table, setpoint, troom, tout) -%}
+          {% set setpoint = setpoint + 0.5 %}
+          {% if setpoint >= troom %}
+            {% set i, j = power_table_position(table, setpoint, troom, tout) | from_json %}
+            {{ table[i][j:] | min }}
+          {% else %}
+            {{ 0 }}
+          {% endif %}
+          {%- endmacro %}
+
+          {% set setpoint = states(eid_room_setpoint) | float(none) %}
+          {% set troom = states(eid_room_temperature) | float(none) %}
+          {% set tout = states(eid_outside_temperature) | float(none) %}
+          {% set table = state_attr('sensor.suntopump_power_table', 'table') %}
+
+          {% if setpoint is none or troom is none or tout is none or table is none %}
+            {{ -1 }}
+          {% else %}
+            {{ power_to_raise(table, setpoint, troom, tout) }}
+          {% endif %}
+
+  - trigger:
+    - trigger: time_pattern
+      seconds: "/10"
+      variables: *input_sensors
+    sensor:
+      - name: "suntopump_available_power"
+        unit_of_measurement: "W"
+        device_class: "power"
+        state: >
+          {% macro input_number(name) -%}
+          {{ states('input_number.suntopump_' + name) }}
+          {%- endmacro %}
+
+          {% set active_power = states(eid_active_power) | float(0) %}
+          {% set hp_power = states(eid_heatpump_power_input) | float(0) %}
+          {% set boost_power = input_number('boost') | float(0) %}
+          {{ (hp_power - active_power + boost_power) | round }}
+
+  - trigger:
+    - trigger: time_pattern
+      seconds: "/10"
+    sensor:
+      - name: "suntopump_power_hint"
+        unit_of_measurement: "W"
+        device_class: "power"
+        state: >
+          {% set avail_avg_short = states('sensor.suntopump_available_power_avg_short') | float(0) %}
+          {% set avail_avg_long = states('sensor.suntopump_available_power_avg_long') | float(0) %}
+          {{ [[avail_avg_short, avail_avg_long] | min, 0] | max }}
+
+  - trigger:
+    - trigger: time_pattern
+      minutes: "/1"
+      variables: *input_sensors
+    sensor:
+      - name: "suntopump_setpoint_hint"
+        unit_of_measurement: "°C"
+        device_class: "temperature"
+        state: >
+          {% macro input_number(name) -%}
+          {{ states('input_number.suntopump_' + name) }}
+          {%- endmacro %}
+
+          {% macro setpoint_hint(table, troom, tout, power_hint) -%}
+          {% if power_hint == 0 %}
+            {{ [input_number('setpoint_min') | float, troom] | min | round(1) }}
+          {% else %}
+            {% set i_max = table | length - 1 %}
+            {% set j_max = table[0] | length - 1 %}
+            {% set i = ([0, troom - tout, i_max] | sort)[1] | round %}
+            {% set ns = namespace(j=0) %}
+            {% for power in table[i] %}
+              {% if power <= power_hint %}
+                {% set ns.j = loop.index0 %}
+              {% endif %}
+            {% endfor %}
+
+            {% set setpoint = (troom + ns.j / 10) | round(1) %}
+            {{ setpoint }}
+          {% endif %}
+          {%- endmacro %}
+
+          {% set table = state_attr('sensor.suntopump_power_table', 'table') %}
+          {% set troom = states(eid_room_temperature) | float(none) %}
+          {% set tout = states(eid_outside_temperature) | float(none) %}
+          {% set power_hint = states('sensor.suntopump_power_hint') | float(none) %}
+
+          {% if table is none or troom is none or tout is none or power_hint is none %}
+            {{ this.state }}
+          {% else %}
+            {{ setpoint_hint(table, troom, tout, power_hint) }}
+          {% endif %}
+
+  - trigger:
+    - trigger: time_pattern
+      minutes: "/1"
+      variables:
+        <<: *input_sensors
+        <<: *setpoint_hold
+    sensor:
+      - name: "suntopump_setpoint"
+        unit_of_measurement: "°C"
+        device_class: "temperature"
+        state: >
+          {% macro input_number(name) -%}
+          {{ states('input_number.suntopump_' + name) }}
+          {%- endmacro %}
+
+          {% set sp_min = input_number('setpoint_min') | float %}
+          {% set sp_max = input_number('setpoint_max') | float %}
+
+          {% set setpoint = states(eid_room_setpoint) | float(none) %}
+          {% if setpoint is none %}
+            {% set setpoint = this.state %}
+          {% else %}
+            {% set setpoint = ([sp_min, setpoint, sp_max] | sort)[1] %}
+            {% set setpoint_hint = states('sensor.suntopump_setpoint_hint') | float %}
+            {% set setpoint_hint = (setpoint_hint * 2) | int / 2 %}
+            {% set setpoint_hint = ([sp_min, setpoint_hint, sp_max] | sort)[1] %}
+
+            {% set last_setpoint_change = as_timestamp(states[eid_room_setpoint].last_changed) | int %}
+            {% set time_since_change = as_timestamp(now()) - last_setpoint_change %}
+            {% if (setpoint_hint < setpoint and time_since_change >= (hold_time_drop_minutes * 60)) or time_since_change >= (hold_time_raise_minutes * 60) %}
+              {% set setpoint = setpoint_hint %}
+            {% endif %}
+          {% endif %}
+          {{ setpoint }}
+
+  - trigger:
+    - trigger: time_pattern
+      minutes: "/5"
+      variables:
+        <<: *input_sensors
+    condition:
+      - condition: time
+        <<: *time_condition
+      - condition: state
+        entity_id: input_boolean.suntopump_active
+        state: "on"
+    sensor:
+      - name: "suntopump_retry_count"
+        state: >
+          {% set retry_count = this.state | int(0) %}
+          {% set room_setpoint = states(eid_room_setpoint) | float(none) %}
+          {% set target_setpoint = states('sensor.suntopump_setpoint') | float(none) %}
+          {% if is_number(room_setpoint) and is_number(target_setpoint) and room_setpoint != target_setpoint %}
+            {% set last_setpoint_change = as_timestamp(states[eid_room_setpoint].last_changed) | int %}
+            {% set time_since_change = as_timestamp(now()) - last_setpoint_change %}
+            {% if time_since_change >= 120 %}
+              {% set retry_count = retry_count + 1 %}
+            {% endif %}
+          {% endif %}
+          {{ retry_count }}
+
+################################################
+## Statistics sensors
+################################################
+sensor:
+  - platform: statistics
+    name: "suntopump_available_power_avg_short"
+    entity_id: sensor.suntopump_available_power
+    state_characteristic: average_linear
+    max_age:
+      minutes: *avg_short_minutes 
+    precision: 0
+
+  - platform: statistics
+    name: "suntopump_available_power_avg_long"
+    entity_id: sensor.suntopump_available_power
+    state_characteristic: average_linear
+    max_age:
+      minutes: *avg_long_minutes
+    precision: 0
+
+################################################
+## Automation
+################################################
+automation:
+    alias: "SunToPump"
+    description: "Control thermostat to use excess solar power"
+    triggers:
+      - trigger: state
+        entity_id:
+          - sensor.suntopump_setpoint
+      - trigger: state
+        entity_id:
+          - sensor.suntopump_retry_count
+      - trigger: state
+        entity_id:
+          - input_boolean.suntopump_active
+        to: "on"
+    conditions:
+      - condition: time
+        <<: *time_condition
+      - condition: state
+        entity_id: input_boolean.suntopump_active
+        state: "on"
+      - condition: template
+        value_template: "{{ is_number(states('sensor.suntopump_setpoint')) }}"
+    actions:
+      - action: climate.set_temperature
+        metadata: {}
+        data:
+          temperature: "{{ states('sensor.suntopump_setpoint') }}"
+        target:
+          entity_id: *eid_thermostat
+    mode: single
