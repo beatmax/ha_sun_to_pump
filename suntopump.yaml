@@ -24,11 +24,15 @@ homeassistant:
         # Thermostat entity id.
         thermostat: &eid_thermostat climate.tstat_XXXX_thermostat
 
-        # Time constraints. Thermostat is only controlled within these times.
-        time_condition: &time_condition
-          enabled: true
-          after: "08:00:00"
-          before: "20:00:00"
+        # Time constraints. If enabled, the thermostat is only controlled
+        # within these times. The setpoint will be forced to the minimum
+        # temperature 'tc_force_min_minutes' minutes before 'tc_before' (this
+        # gives some margin for possible required retries).
+        time_constraints: &time_constraints
+          - &tc_enabled true
+          - &tc_after "08:00:00"
+          - &tc_before "20:00:00"
+          - &tc_force_min_minutes 15
 
         # Available power filter. An average of recent 'available power' is
         # calculated for each of the time windows given here. The 'power_hint'
@@ -54,6 +58,11 @@ homeassistant:
           # Reset. Set to true (and then back to false) to remove recorded power
           # values (reset sensor.suntopump_power_table_record).
           power_table_reset: false
+
+      time_condition: &time_condition
+        enabled: *tc_enabled
+        after: *tc_after
+        before: *tc_before
 
     input_boolean.suntopump_active: *common
     input_number.suntopump_setpoint_max: *common
@@ -455,6 +464,9 @@ template:
       variables:
         <<: *input_sensors
         <<: *setpoint_hold
+        tc_enabled: *tc_enabled
+        tc_before: *tc_before
+        tc_force_min_minutes: *tc_force_min_minutes
     sensor:
       - name: "suntopump_setpoint"
         unit_of_measurement: "°C"
@@ -482,6 +494,14 @@ template:
               {% set setpoint = setpoint_hint %}
             {% endif %}
           {% endif %}
+
+          {% if tc_enabled | bool %}
+            {% set force_min_at = as_timestamp(today_at(tc_before)) - (tc_force_min_minutes * 60) %}
+            {% if as_timestamp(now()) >= force_min_at %}
+              {% set setpoint = sp_min %}
+            {% endif %}
+          {% endif %}
+
           {{ setpoint }}
 
   - trigger:
